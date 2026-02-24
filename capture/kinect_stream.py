@@ -1,4 +1,5 @@
 from pykinect2 import PyKinectV2, PyKinectRuntime
+from pykinect2.PyKinectV2 import *
 import numpy as np
 import cv2
 
