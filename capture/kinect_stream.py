@@ -1,33 +1,42 @@
+import sys
+import os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 from pykinect2 import PyKinectV2, PyKinectRuntime
-from pykinect2.PyKinectV2 import *
 import numpy as np
-import cv2
+from config import (KINECT_COLOR_WIDTH, KINECT_COLOR_HEIGHT,
+                    KINECT_IR_WIDTH, KINECT_IR_HEIGHT)
 
 class KinectCapture:
     def __init__(self):
-        self.kinect = PyKinectRuntime.PyKinectRuntime(
+        self._kinect = PyKinectRuntime.PyKinectRuntime(
             PyKinectV2.FrameSourceTypes_Color |
             PyKinectV2.FrameSourceTypes_Depth |
             PyKinectV2.FrameSourceTypes_Infrared
         )
+        print('[KinectCapture] Sensor inicializado.')
 
     def get_color_frame(self):
-        if self.kinect.has_new_color_frame():
-            frame = self.kinect.get_last_color_frame()
-            return frame.reshape((1080, 1920, 4)).astype(np.uint8)
+        if self._kinect.has_new_color_frame():
+            frame = self._kinect.get_last_color_frame()
+            return frame.reshape((KINECT_COLOR_HEIGHT,
+                                   KINECT_COLOR_WIDTH, 4)).astype(np.uint8)
         return None
 
     def get_depth_frame(self):
-        if self.kinect.has_new_depth_frame():
-            frame = self.kinect.get_last_depth_frame()
-            return frame.reshape((424, 512)).astype(np.float32)
+        if self._kinect.has_new_depth_frame():
+            frame = self._kinect.get_last_depth_frame()
+            return frame.reshape((KINECT_IR_HEIGHT,
+                                   KINECT_IR_WIDTH)).astype(np.float32)
         return None
 
     def get_ir_frame(self):
-        if self.kinect.has_new_infrared_frame():
-            frame = self.kinect.get_last_infrared_frame()
-            return frame.reshape((424, 512)).astype(np.float32)
+        if self._kinect.has_new_infrared_frame():
+            frame = self._kinect.get_last_infrared_frame()
+            return frame.reshape((KINECT_IR_HEIGHT,
+                                   KINECT_IR_WIDTH)).astype(np.float32)
         return None
 
     def close(self):
-        self.kinect.close()
+        self._kinect.close()
+        print('[KinectCapture] Sensor liberado.')
