@@ -1,209 +1,216 @@
-import sys, os
+import sys, os, time
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Parche Python 3.8
+if not hasattr(time, 'clock'):
+    time.clock = time.perf_counter
 
 from pykinect2 import PyKinectV2, PyKinectRuntime
 import numpy as np
 import cv2
 import mediapipe as mp
 from datetime import datetime
-from config import (KINECT_COLOR_WIDTH, KINECT_COLOR_HEIGHT,
-                    KINECT_IR_WIDTH,    KINECT_IR_HEIGHT)
+import winsound
 
-# ── Configuración ─────────────────────────────────────
-DATASET_DIR        = 'dataset'
-CALIBRATION_FRAMES = 30
-CLASE              = 'normal'
+# ── Dimensiones ───────────────────────────────────────
+K_W, K_H   = 1920, 1080
+IR_W, IR_H = 512, 424
 
-# Crear carpetas
-for split in ['train', 'val']:
-    os.makedirs(f'{DATASET_DIR}/{split}/{CLASE}', exist_ok=True)
+# ── Dataset ───────────────────────────────────────────
+DATASET_DIR = 'dataset'
+CLASE       = 'normal'
+for s in ['train', 'val']:
+    os.makedirs(f'{DATASET_DIR}/{s}/{CLASE}', exist_ok=True)
 
-counters = {'train': 0, 'val': 0}
+counters    = {'train': 0, 'val': 0}
+split       = 'train'
+flash_timer = 0
 
-# ── Helpers IR ────────────────────────────────────────
-baseline  = None
-calib_buf = []
-calibrado = False
-
-def agregar_calibracion(ir_frame):
-    global baseline, calibrado
-    calib_buf.append(ir_frame.astype(np.float32))
-    if len(calib_buf) >= CALIBRATION_FRAMES:
-        baseline  = np.mean(calib_buf, axis=0)
-        calibrado = True
-        print('\n✅ IR Calibrado. ¡Listo para capturar!')
-
-def procesar_ir(ir_frame, depth_frame=None):
-    frame = ir_frame.astype(np.float32)
-    if depth_frame is not None:
-        d     = np.clip(depth_frame / 1000.0, 0.3, 8.0)
-        frame = frame / np.power(d, 3.41)
-    if calibrado:
-        frame = np.clip(frame - baseline, 0, None)
-    p_lo  = np.percentile(frame, 1)
-    p_hi  = np.percentile(frame, 99)
-    frame = np.clip((frame - p_lo) / (p_hi - p_lo + 1e-6), 0, 1)
-    return (frame * 255).astype(np.uint8)
-
-def estimar_temp(ir_roi):
-    mean_ir = float(np.mean(ir_roi))
-    return round(35.0 + (mean_ir / 255.0) * 4.5, 1)
-
-def guardar_par(rgb_roi, ir_roi, split):
-    ts    = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    fname = f'{DATASET_DIR}/{split}/{CLASE}/{ts}'
-    cv2.imwrite(f'{fname}_rgb.jpg', cv2.resize(
-        cv2.cvtColor(rgb_roi, cv2.COLOR_BGRA2BGR), (224, 224)))
-    cv2.imwrite(f'{fname}_ir.jpg',  cv2.resize(ir_roi, (224, 224)))
-    counters[split] += 1
-    print(f'  ✅ [{CLASE.upper()} / {split.upper()}] '
-          f'Guardado #{counters[split]} '
-          f'| Temp: {estimar_temp(ir_roi)}°C')
-
-# ── Inicializar ───────────────────────────────────────
-print('\n' + '='*50)
-print('   CAPTURA CLASE: NORMAL')
-print('='*50)
+# ── Inicializar Kinect ────────────────────────────────
 print('Inicializando Kinect v2...')
-
 try:
     kinect = PyKinectRuntime.PyKinectRuntime(
-        PyKinectV2.FrameSourceTypes_Color   |
-        PyKinectV2.FrameSourceTypes_Depth   |
-        PyKinectV2.FrameSourceTypes_Infrared
+        PyKinectV2.FrameSourceTypes_Color    |
+        PyKinectV2.FrameSourceTypes_Infrared |
+        PyKinectV2.FrameSourceTypes_Depth
     )
-    print('✅ Kinect inicializado correctamente.')
+    print('✅ Kinect inicializado.')
 except Exception as e:
-    print(f'❌ Error al inicializar Kinect: {e}')
-    print('Verifica: USB 3.0, alimentación y SDK instalado.')
+    print(f'❌ Error Kinect: {e}')
     input('Presiona Enter para salir...')
-    exit(1)
-    
+    sys.exit()
+
+# ── MediaPipe ─────────────────────────────────────────
 mp_face  = mp.solutions.face_detection
 face_det = mp_face.FaceDetection(
-    min_detection_confidence=0.75, model_selection=0)
+    min_detection_confidence=0.5, model_selection=0)
 
-print('✅ Kinect listo.')
-print('\n📋 INSTRUCCIONES:')
-print('  • Persona en reposo, temperatura ambiente normal')
-print('  • Mantén el encuadre libre al inicio (calibración IR)')
-print('\nControles:')
-print('  [ESPACIO] Capturar   [T] Split Train')
-print('  [V] Split Val        [Q] Salir\n')
+print('\nControles: [ESPACIO] Capturar | [T] Train | [V] Val | [Q] Salir\n')
 
-split = 'train'
+# ── Buffers persistentes ──────────────────────────────
+last_ir    = None
+last_depth = None
+last_color = None
 
-# ── Bucle ─────────────────────────────────────────────
-while True:
-    color_frame = depth_frame = ir_frame = None
-
-    if kinect.has_new_color_frame():
-        color_frame = kinect.get_last_color_frame().reshape(
-            (KINECT_COLOR_HEIGHT, KINECT_COLOR_WIDTH, 4)).astype(np.uint8)
-    if kinect.has_new_depth_frame():
-        depth_frame = kinect.get_last_depth_frame().reshape(
-            (KINECT_IR_HEIGHT, KINECT_IR_WIDTH)).astype(np.float32)
+# ── Esperar sensor IR con ventana visible ─────────────
+print('Esperando sensor IR...')
+timeout = 0
+while last_ir is None:
     if kinect.has_new_infrared_frame():
-        ir_frame = kinect.get_last_infrared_frame().reshape(
-            (KINECT_IR_HEIGHT, KINECT_IR_WIDTH)).astype(np.float32)
+        last_ir = kinect.get_last_infrared_frame().reshape(
+            (IR_H, IR_W)).astype(np.float32)
+    if kinect.has_new_color_frame():
+        last_color = kinect.get_last_color_frame().reshape(
+            (K_H, K_W, 4)).astype(np.uint8)
 
-    if color_frame is None or ir_frame is None:
+    # Mostrar ventana mientras espera
+    if last_color is not None:
+        waiting = cv2.resize(
+            cv2.cvtColor(last_color, cv2.COLOR_BGRA2BGR), (640, 360))
+        cv2.rectangle(waiting, (0, 0), (640, 40), (20, 20, 20), -1)
+        cv2.putText(waiting,
+                    'Iniciando sensor IR... espera unos segundos',
+                    (10, 26),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
+        cv2.imshow('Captura NORMAL — Kinect v2', waiting)
+
+    cv2.waitKey(1)
+    timeout += 1
+
+    # Timeout 10 segundos (~300 frames)
+    if timeout > 300:
+        print('⚠️  IR tardando, continuando sin esperar.')
+        break
+
+print('✅ Sensor IR listo. ¡Puedes capturar!')
+
+# ── Bucle principal ───────────────────────────────────
+while True:
+
+    # Actualizar buffers
+    if kinect.has_new_color_frame():
+        last_color = kinect.get_last_color_frame().reshape(
+            (K_H, K_W, 4)).astype(np.uint8)
+
+    if kinect.has_new_infrared_frame():
+        last_ir = kinect.get_last_infrared_frame().reshape(
+            (IR_H, IR_W)).astype(np.float32)
+
+    if kinect.has_new_depth_frame():
+        last_depth = kinect.get_last_depth_frame().reshape(
+            (IR_H, IR_W)).astype(np.float32)
+
+    if last_color is None:
         continue
 
-    # Calibración
-    if not calibrado:
-        agregar_calibracion(ir_frame)
-        prog = int(len(calib_buf) / CALIBRATION_FRAMES * 100)
-        print(f'\r  Calibrando IR: {prog}%  ', end='', flush=True)
-        continue
+    # ── Display principal ─────────────────────────────
+    display = cv2.resize(
+        cv2.cvtColor(last_color, cv2.COLOR_BGRA2BGR), (640, 360))
 
-    # Procesar IR
-    ir_proc    = procesar_ir(ir_frame, depth_frame)
-    ir_colored = cv2.applyColorMap(ir_proc, cv2.COLORMAP_INFERNO)
-    ir_show    = cv2.resize(ir_colored, (320, 240))
+    # ── Miniatura IR ──────────────────────────────────
+    if last_ir is not None:
+        ir_norm = (np.clip(last_ir / 65535.0, 0, 1) * 255).astype(np.uint8)
+        ir_mini = cv2.resize(
+            cv2.applyColorMap(ir_norm, cv2.COLORMAP_INFERNO), (150, 140))
+        display[210:350, 480:630] = ir_mini
+        ir_texto = 'IR OK'
+        ir_color = (0, 220, 0)
+    else:
+        ir_texto = 'IR no disponible'
+        ir_color = (0, 0, 255)
 
-    # Detección facial
-    rgb_for_mp = cv2.cvtColor(color_frame, cv2.COLOR_BGRA2RGB)
-    results    = face_det.process(rgb_for_mp)
-    display    = cv2.resize(
-        cv2.cvtColor(color_frame, cv2.COLOR_BGRA2BGR), (960, 540))
+    # ── Detección facial ──────────────────────────────
+    small_rgb = cv2.cvtColor(
+        cv2.resize(last_color, (640, 360)), cv2.COLOR_BGRA2RGB)
+    res = face_det.process(small_rgb)
 
-    rois_rgb, rois_ir = [], []
+    rostros = 0
+    if res.detections:
+        rostros = len(res.detections)
+        for det in res.detections:
+            b  = det.location_data.relative_bounding_box
+            x1 = int(b.xmin * 640)
+            y1 = int(b.ymin * 360)
+            x2 = int((b.xmin + b.width)  * 640)
+            y2 = int((b.ymin + b.height) * 360)
+            cv2.rectangle(display, (x1, y1), (x2, y2), (0, 220, 0), 2)
+            cv2.putText(display, 'NORMAL',
+                        (x1 + 5, y1 - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6, (0, 220, 0), 2)
 
-    if results.detections:
-        H0, W0 = color_frame.shape[:2]
-        for det in results.detections:
-            bb = det.location_data.relative_bounding_box
-            x  = int(bb.xmin * W0);  y  = int(bb.ymin * H0)
-            w  = int(bb.width * W0); h  = int(bb.height * H0)
-            if w <= 0 or h <= 0:
-                continue
+    # ── Flash de captura ──────────────────────────────
+    if flash_timer > 0:
+        cv2.rectangle(display, (0, 0), (640, 360), (0, 255, 0), 12)
+        flash_timer -= 1
 
-            pad  = 30
-            roi_rgb = color_frame[
-                max(0,y-pad):min(H0,y+h+pad),
-                max(0,x-pad):min(W0,x+w+pad)]
-
-            sx, sy = 512/W0, 424/H0
-            xi, yi = int(x*sx), int(y*sy)
-            wi, hi = int(w*sx), int(h*sy)
-            p2     = 15
-            roi_ir = ir_proc[
-                max(0,yi-p2):min(424,yi+hi+p2),
-                max(0,xi-p2):min(512,xi+wi+p2)]
-
-            if roi_rgb.size > 0 and roi_ir.size > 0:
-                rois_rgb.append(roi_rgb)
-                rois_ir.append(roi_ir)
-                temp = estimar_temp(roi_ir)
-
-                # Bbox en display
-                sx_d, sy_d = 960/W0, 540/H0
-                xd = int(x*sx_d); yd = int(y*sy_d)
-                wd = int(w*sx_d); hd = int(h*sy_d)
-                cv2.rectangle(display,(xd,yd),(xd+wd,yd+hd),(0,220,0),2)
-                cv2.putText(display, f'{temp}C',
-                            (xd+5, yd-8),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.65, (0,220,0), 2)
-
-    # Panel UI
-    H, W = display.shape[:2]
-    cv2.rectangle(display, (0,0), (W,60), (20,20,20), -1)
-    cv2.putText(display, f'MODO: NORMAL  |  Split: {split.upper()}',
-                (10,22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,220,0), 2)
+    # ── Panel UI ──────────────────────────────────────
+    # Barra superior
+    cv2.rectangle(display, (0, 0), (640, 38), (20, 20, 20), -1)
     cv2.putText(display,
-                f'Train: {counters["train"]}   Val: {counters["val"]}   '
-                f'Rostros: {len(rois_rgb)}',
-                (10,50), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200,200,200), 1)
-    cv2.rectangle(display, (0,H-40), (W,H), (20,20,20), -1)
+                f'NORMAL | {split.upper()} | '
+                f'Train:{counters["train"]}  Val:{counters["val"]}',
+                (8, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 220, 0), 2)
+
+    # Estado IR
+    cv2.putText(display, ir_texto,
+                (482, 206),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, ir_color, 1)
+
+    # Barra inferior
+    cv2.rectangle(display, (0, 338), (640, 360), (20, 20, 20), -1)
     cv2.putText(display,
-                '[ESPACIO] Capturar  [T] Train  [V] Val  [Q] Salir',
-                (10,H-12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200,200,200), 1)
+                f'Rostros:{rostros}  '
+                f'[ESPACIO] Capturar  [T] Train  [V] Val  [Q] Salir',
+                (8, 354),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 180, 180), 1)
 
-    cv2.imshow('Captura NORMAL — RGB', display)
-    cv2.imshow('Captura NORMAL — IR',  ir_show)
+    cv2.imshow('Captura NORMAL — Kinect v2', display)
 
+    # ── Teclado ───────────────────────────────────────
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('q'):
         break
+
     elif key == ord('t'):
         split = 'train'
-        print(f'\n▶ Split: TRAIN')
+        print('▶ Split: TRAIN')
+
     elif key == ord('v'):
         split = 'val'
-        print(f'\n▶ Split: VAL')
-    elif key == ord(' '):
-        if len(rois_rgb) == 0:
-            print('\n⚠️  No se detectó rostro.')
-        else:
-            for rgb_roi, ir_roi in zip(rois_rgb, rois_ir):
-                guardar_par(rgb_roi, ir_roi, split)
+        print('▶ Split: VAL')
 
-# Cierre
+    elif key == ord(' '):
+        if last_color is None:
+            print('⚠️  Sin frame de color.')
+        elif rostros == 0:
+            print('⚠️  No se detectó rostro. Colócate frente al Kinect.')
+        else:
+            ts      = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+            rgb_224 = cv2.resize(
+                cv2.cvtColor(last_color, cv2.COLOR_BGRA2BGR), (224, 224))
+            cv2.imwrite(
+                f'{DATASET_DIR}/{split}/{CLASE}/{ts}_rgb.jpg', rgb_224)
+
+            if last_ir is not None:
+                ir_norm = (np.clip(
+                    last_ir / 65535.0, 0, 1) * 255).astype(np.uint8)
+                ir_224  = cv2.resize(ir_norm, (224, 224))
+                cv2.imwrite(
+                    f'{DATASET_DIR}/{split}/{CLASE}/{ts}_ir.jpg', ir_224)
+                print(f'✅ [{split.upper()}] RGB+IR '
+                      f'#{counters[split]+1} guardado')
+            else:
+                print(f'✅ [{split.upper()}] Solo RGB '
+                      f'#{counters[split]+1} guardado')
+
+            counters[split] += 1
+            flash_timer = 8
+            winsound.Beep(1000, 80)
+
+# ── Cierre ────────────────────────────────────────────
 kinect.close()
 cv2.destroyAllWindows()
-print('\n' + '='*50)
-print(f'  TOTAL NORMAL — Train: {counters["train"]} | Val: {counters["val"]}')
-print('='*50)
+print(f'\nRESUMEN NORMAL — Train:{counters["train"]} | Val:{counters["val"]}')
